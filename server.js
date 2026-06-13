@@ -18,12 +18,15 @@ const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
   let joinedChannel = null;
 
+  // Mark alive for heartbeat
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'join') {
-      // Client identifies which mat channel to join
       const ch = 'mat_' + msg.mat;
       joinedChannel = ch;
       if (!channels[ch]) channels[ch] = new Set();
@@ -31,7 +34,6 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({ type: 'joined', mat: msg.mat }));
 
     } else if (msg.type === 'state') {
-      // Control panel broadcasting state for a mat
       const ch = 'mat_' + msg.mat;
       if (!channels[ch]) return;
       const payload = JSON.stringify(msg);
@@ -40,6 +42,10 @@ wss.on('connection', (ws) => {
           client.send(payload);
         }
       });
+
+    } else if (msg.type === 'ping') {
+      // Client-side keepalive ping — respond with pong
+      ws.send(JSON.stringify({ type: 'pong' }));
     }
   });
 
@@ -55,6 +61,21 @@ wss.on('connection', (ws) => {
     }
   });
 });
+
+// Server-side heartbeat — ping all clients every 25 seconds
+// Clients that don't respond are terminated so they reconnect cleanly
+const heartbeat = setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      return;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 25000);
+
+wss.on('close', () => clearInterval(heartbeat));
 
 server.listen(PORT, () => {
   console.log('CJL relay server running on port ' + PORT);
