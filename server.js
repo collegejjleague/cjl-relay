@@ -27,14 +27,26 @@ wss.on('connection', (ws) => {
     try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'join') {
-      const ch = 'mat_' + msg.mat;
+      // ch can be 'mat_N' for scoring channels or 'bracket' for bracket updates
+      const ch = msg.channel || ('mat_' + msg.mat);
       joinedChannel = ch;
       if (!channels[ch]) channels[ch] = new Set();
       channels[ch].add(ws);
-      ws.send(JSON.stringify({ type: 'joined', mat: msg.mat }));
+      ws.send(JSON.stringify({ type: 'joined', channel: ch }));
 
     } else if (msg.type === 'state') {
       const ch = 'mat_' + msg.mat;
+      if (!channels[ch]) return;
+      const payload = JSON.stringify(msg);
+      channels[ch].forEach(client => {
+        if (client !== ws && client.readyState === 1) {
+          client.send(payload);
+        }
+      });
+
+    } else if (msg.type === 'bracket') {
+      // Bracket update broadcast — relay to all bracket-channel subscribers
+      const ch = 'bracket';
       if (!channels[ch]) return;
       const payload = JSON.stringify(msg);
       channels[ch].forEach(client => {
