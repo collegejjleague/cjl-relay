@@ -8,9 +8,13 @@ const channels = {};
 
 // =========================================================================
 // CENTRALIZED DISASTER RECOVERY MEMORY LAYER
-// Keeps the absolute latest state of each mat cached in server RAM
+// Keeps the absolute latest state of each mat cached in server RAM.
+// Only replayed to newly-joined clients if it's still fresh (see TTL below) —
+// otherwise leftover state from an earlier session/tournament could get
+// replayed into a brand-new one just because the relay never restarted.
 // =========================================================================
 const stateCache = {};
+const STATE_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes — covers a real refresh/reconnect; anything older is a different session
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -38,18 +42,25 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({ type: 'joined', channel: ch }));
 
       // =========================================================================
-      // PUSH CACHED STATE TO NEWLY CONNECTED COMPUTER
-      // If a second control panel or scoreboard opens, immediately feed it the truth
+      // PUSH CACHED STATE TO NEWLY CONNECTED COMPUTER — ONLY IF STILL FRESH
+      // If a second control panel or scoreboard opens, immediately feed it the
+      // truth — but only if that cached truth is recent. Stale entries are
+      // dropped instead of replayed.
       // =========================================================================
-      if (stateCache[ch]) {
-        ws.send(JSON.stringify({ type: 'sync_state', state: stateCache[ch] }));
+      const cached = stateCache[ch];
+      if (cached) {
+        if (Date.now() - cached.ts <= STATE_CACHE_TTL_MS) {
+          ws.send(JSON.stringify({ type: 'sync_state', state: cached.msg }));
+        } else {
+          delete stateCache[ch];
+        }
       }
 
     } else if (msg.type === 'state') {
       const ch = 'mat_' + msg.mat;
       
-      // Save the state to server memory
-      stateCache[ch] = msg;
+      // Save the state to server memory, tagged with when it arrived
+      stateCache[ch] = { msg, ts: Date.now() };
 
       if (!channels[ch]) return;
       const payload = JSON.stringify(msg);
