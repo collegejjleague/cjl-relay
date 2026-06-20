@@ -4,11 +4,15 @@ const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 8080;
 
 // Track connected clients per mat channel
-// channels: { 'mat_1': Set<ws>, 'mat_2': Set<ws>, ... }
 const channels = {};
 
+// =========================================================================
+// CENTRALIZED DISASTER RECOVERY MEMORY LAYER
+// Keeps the absolute latest state of each mat cached in server RAM
+// =========================================================================
+const stateCache = {};
+
 const server = http.createServer((req, res) => {
-  // Health check endpoint — keeps Render happy and lets us wake the server
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('CJL Relay OK');
 });
@@ -18,7 +22,6 @@ const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
   let joinedChannel = null;
 
-  // Mark alive for heartbeat
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
@@ -27,15 +30,27 @@ wss.on('connection', (ws) => {
     try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'join') {
-      // ch can be 'mat_N' for scoring channels or 'bracket' for bracket updates
       const ch = msg.channel || ('mat_' + msg.mat);
       joinedChannel = ch;
       if (!channels[ch]) channels[ch] = new Set();
       channels[ch].add(ws);
+      
       ws.send(JSON.stringify({ type: 'joined', channel: ch }));
+
+      // =========================================================================
+      // PUSH CACHED STATE TO NEWLY CONNECTED COMPUTER
+      // If a second control panel or scoreboard opens, immediately feed it the truth
+      // =========================================================================
+      if (stateCache[ch]) {
+        ws.send(JSON.stringify({ type: 'sync_state', state: stateCache[ch] }));
+      }
 
     } else if (msg.type === 'state') {
       const ch = 'mat_' + msg.mat;
+      
+      // Save the state to server memory
+      stateCache[ch] = msg;
+
       if (!channels[ch]) return;
       const payload = JSON.stringify(msg);
       channels[ch].forEach(client => {
@@ -45,7 +60,6 @@ wss.on('connection', (ws) => {
       });
 
     } else if (msg.type === 'bracket') {
-      // Bracket update broadcast — relay to all bracket-channel subscribers
       const ch = 'bracket';
       if (!channels[ch]) return;
       const payload = JSON.stringify(msg);
@@ -56,7 +70,6 @@ wss.on('connection', (ws) => {
       });
 
     } else if (msg.type === 'ping') {
-      // Client-side keepalive ping — respond with pong
       ws.send(JSON.stringify({ type: 'pong' }));
     }
   });
@@ -74,8 +87,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Server-side heartbeat — ping all clients every 25 seconds
-// Clients that don't respond are terminated so they reconnect cleanly
 const heartbeat = setInterval(() => {
   wss.clients.forEach(ws => {
     if (ws.isAlive === false) {
@@ -87,8 +98,10 @@ const heartbeat = setInterval(() => {
   });
 }, 25000);
 
-wss.on('close', () => clearInterval(heartbeat));
+wss.on('close', () => {
+  clearInterval(heartbeat);
+});
 
 server.listen(PORT, () => {
-  console.log('CJL relay server running on port ' + PORT);
+  console.log(`Server running on port ${PORT}`);
 });
