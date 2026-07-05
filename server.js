@@ -19,16 +19,20 @@ const STATE_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes — covers a real refresh
 // =========================================================================
 // BOUT HISTORY — built entirely from real-time 'state' traffic already
 // flowing through this relay. No external API calls of any kind: nothing is
-// fetched from Apps Script, Sheets, or anywhere else. When a mat's state
-// transitions to a new bout (or its matchResults gets cleared for the next
-// bout), whatever completed matches were in the outgoing state get archived
-// here in memory and broadcast to anyone subscribed to the 'history' channel.
+// fetched from Apps Script, Sheets, or anywhere else.
+//
+// Each bout (keyed by boutNum + school1 + school2) gets ONE live entry that
+// is upserted every time a match is submitted for it — not just once at the
+// end of the bout. So the history tab fills in match-by-match, in real time,
+// instead of waiting for the whole bout to finish. When a mat later moves on
+// to a new bout (new boutNum/schools), that becomes a new entry and the
+// finished one is left as-is.
 //
 // Trade-off vs. an Apps Script–backed version: this only remembers bouts
-// completed since the relay process last started — a relay restart clears
-// it. In exchange, there is zero ongoing API/network cost of any kind.
+// touched since the relay process last started — a relay restart clears it.
+// In exchange, there is zero ongoing API/network cost of any kind.
 // =========================================================================
-const archivedBouts = [];       // most-recent-first array of completed bouts
+const archivedBouts = [];       // most-recent-first array of bout entries (live + completed)
 const HISTORY_MAX_ENTRIES = 50; // safety cap so memory can't grow unbounded over a long event
 const HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000; // drop entries older than a day
 
@@ -51,35 +55,41 @@ function broadcastHistory() {
   });
 }
 
-// Detects a bout boundary between an outgoing cached state and an incoming
-// one for the same mat, and archives the outgoing bout's completed matches
-// if there were any. Mirrors the same transition logic the status page uses
-// client-side for the sync_state fix, just applied server-side instead.
-function archiveIfBoutEnded(oldState, newState) {
-  if (!oldState || !Array.isArray(oldState.matchResults) || oldState.matchResults.length === 0) return;
+function boutKey(state) {
+  return (state.boutNum || '') + '::' + (state.school1 || '') + '::' + (state.school2 || '');
+}
 
-  const boutChanged = (newState && newState.boutNum || '') !== (oldState.boutNum || '');
-  const resultsCleared = newState && Array.isArray(newState.matchResults) && newState.matchResults.length === 0;
+// Upserts the live/completed entry for whatever bout this state belongs to.
+// Only touches history (and only broadcasts) when the submitted matches for
+// that bout actually changed, so a plain timer tick doesn't cause a rebroadcast
+// (which would otherwise slam every viewer's open match-history dropdown shut).
+function upsertBoutHistory(state) {
+  if (!state || !Array.isArray(state.matchResults) || state.matchResults.length === 0) return;
 
-  if (!boutChanged && !resultsCleared) return;
+  const key = boutKey(state);
+  const idx = archivedBouts.findIndex(b => b.key === key);
+  const existing = idx !== -1 ? archivedBouts[idx] : null;
 
-  const alreadyArchived = archivedBouts.some(b =>
-    b.boutNum === oldState.boutNum && b.school1 === oldState.school1 && b.school2 === oldState.school2
-  );
-  if (alreadyArchived) return;
+  const matchesChanged = !existing || JSON.stringify(existing.matches) !== JSON.stringify(state.matchResults);
+  const teamPtsChanged = !existing || existing.teamPts1 !== (state.teamPts1 ?? '') || existing.teamPts2 !== (state.teamPts2 ?? '');
+  if (!matchesChanged && !teamPtsChanged) return;
 
-  archivedBouts.unshift({
-    boutNum: oldState.boutNum || '',
-    school1: oldState.school1 || '',
-    school2: oldState.school2 || '',
-    color1: oldState.color1 || '',
-    color2: oldState.color2 || '',
-    mode: oldState.mode || '',
-    teamPts1: oldState.teamPts1 ?? '',
-    teamPts2: oldState.teamPts2 ?? '',
-    matches: oldState.matchResults,
+  const entry = {
+    key,
+    boutNum: state.boutNum || '',
+    school1: state.school1 || '',
+    school2: state.school2 || '',
+    color1: state.color1 || '',
+    color2: state.color2 || '',
+    mode: state.mode || '',
+    teamPts1: state.teamPts1 ?? '',
+    teamPts2: state.teamPts2 ?? '',
+    matches: state.matchResults,
     archivedAt: Date.now()
-  });
+  };
+
+  if (idx !== -1) archivedBouts.splice(idx, 1);
+  archivedBouts.unshift(entry);
 
   pruneHistory();
   broadcastHistory();
@@ -134,11 +144,10 @@ wss.on('connection', (ws) => {
     } else if (msg.type === 'state') {
       const ch = 'mat_' + msg.mat;
 
-      // Detect a bout boundary against whatever was cached before, and
-      // archive the outgoing bout's completed matches if applicable —
-      // purely from data already passing through this relay.
-      const previous = stateCache[ch];
-      archiveIfBoutEnded(previous ? previous.msg : null, msg);
+      // Keep the bout's history entry current with whatever matches have
+      // been submitted so far — fires on every submitted match, not just
+      // once when the bout ends.
+      upsertBoutHistory(msg);
 
       // Save the state to server memory, tagged with when it arrived
       stateCache[ch] = { msg, ts: Date.now() };
