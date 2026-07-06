@@ -95,6 +95,7 @@ let youtubeStatus = { isLive: false, viewers: null };
 // public /live page. Works whether or not an API key is configured.
 function fetchYoutubeLiveStatus() {
   if (!YOUTUBE_CHECK_ENABLED) return;
+  console.log('Checking YouTube live status...');
   const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}/live`;
   https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
     let body = '';
@@ -106,28 +107,22 @@ function fetchYoutubeLiveStatus() {
                                 body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
         if (canonicalMatch) videoId = canonicalMatch[1];
 
-        // Free signal first — a canonical video ID can show up on this page
-        // even when you're NOT currently live (e.g. it points at your last
-        // broadcast), so this flag is what actually gates whether we spend
-        // any API quota at all.
         const freeSignalLive = !!videoId && (/"isLiveNow"\s*:\s*true/.test(body) || /"style"\s*:\s*"LIVE"/.test(body));
+        console.log(`YouTube page check: videoId=${videoId}, freeSignalLive=${freeSignalLive}`);
 
         if (!freeSignalLive) {
-          // Not live (per the free check) — zero API calls, full stop.
           applyYoutubeStatus(false, null);
           return;
         }
 
         if (YOUTUBE_API_KEY) {
-          // Only reaches here when the free check already thinks you're
-          // live, so this confirms + gets an accurate viewer count — it
-          // does NOT run continuously while you're offline.
+          console.log('Confirming live status via YouTube API...');
           confirmLiveViaApi(videoId);
         } else {
-          // No API key configured — use the free viewer-count guess instead.
           let viewers = null;
           const viewMatch = body.match(/"concurrentViewers"\s*:\s*"(\d+)"/);
           if (viewMatch) viewers = parseInt(viewMatch[1], 10);
+          console.log(`Using free page check: viewers=${viewers}`);
           applyYoutubeStatus(true, viewers);
         }
       } catch (err) {
@@ -150,13 +145,18 @@ function confirmLiveViaApi(videoId) {
       try {
         const data = JSON.parse(body);
         const item = data.items && data.items[0];
-        if (!item) { applyYoutubeStatus(false, null); return; }
+        if (!item) { 
+          console.log('YouTube API: no video item found');
+          applyYoutubeStatus(false, null); 
+          return; 
+        }
 
         const isLive = item.snippet && item.snippet.liveBroadcastContent === 'live';
         const viewers = item.liveStreamingDetails && item.liveStreamingDetails.concurrentViewers
           ? parseInt(item.liveStreamingDetails.concurrentViewers, 10)
           : null;
 
+        console.log(`YouTube API confirmed: isLive=${isLive}, viewers=${viewers}`);
         applyYoutubeStatus(isLive, viewers);
       } catch (err) {
         console.error('Failed to parse YouTube Data API response:', err.message);
@@ -170,7 +170,11 @@ function confirmLiveViaApi(videoId) {
 function applyYoutubeStatus(isLive, viewers) {
   const changed = youtubeStatus.isLive !== isLive || youtubeStatus.viewers !== viewers;
   youtubeStatus = { isLive, viewers };
-  if (changed) broadcastYoutubeStatus();
+  console.log(`YouTube status set: isLive=${isLive}, viewers=${viewers}, changed=${changed}`);
+  if (changed) {
+    console.log('Broadcasting YouTube status update...');
+    broadcastYoutubeStatus();
+  }
 }
 
 function broadcastYoutubeStatus() {
@@ -183,6 +187,7 @@ function broadcastYoutubeStatus() {
 }
 
 if (YOUTUBE_CHECK_ENABLED) {
+  console.log(`YouTube live-status check enabled. Polling every ${YOUTUBE_POLL_MS}ms. Channel ID: ${YOUTUBE_CHANNEL_ID}`);
   fetchYoutubeLiveStatus();
   setInterval(fetchYoutubeLiveStatus, YOUTUBE_POLL_MS);
 } else {
