@@ -1,4 +1,5 @@
 const http = require('http');
+const https = require('https');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
@@ -19,20 +20,16 @@ const STATE_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes — covers a real refresh
 // =========================================================================
 // BOUT HISTORY — built entirely from real-time 'state' traffic already
 // flowing through this relay. No external API calls of any kind: nothing is
-// fetched from Apps Script, Sheets, or anywhere else.
-//
-// Each bout (keyed by boutNum + school1 + school2) gets ONE live entry that
-// is upserted every time a match is submitted for it — not just once at the
-// end of the bout. So the history tab fills in match-by-match, in real time,
-// instead of waiting for the whole bout to finish. When a mat later moves on
-// to a new bout (new boutNum/schools), that becomes a new entry and the
-// finished one is left as-is.
+// fetched from Apps Script, Sheets, or anywhere else. When a mat's state
+// transitions to a new bout (or its matchResults gets cleared for the next
+// bout), whatever completed matches were in the outgoing state get archived
+// here in memory and broadcast to anyone subscribed to the 'history' channel.
 //
 // Trade-off vs. an Apps Script–backed version: this only remembers bouts
-// touched since the relay process last started — a relay restart clears it.
-// In exchange, there is zero ongoing API/network cost of any kind.
+// completed since the relay process last started — a relay restart clears
+// it. In exchange, there is zero ongoing API/network cost of any kind.
 // =========================================================================
-const archivedBouts = [];       // most-recent-first array of bout entries (live + completed)
+const archivedBouts = [];       // most-recent-first array of completed bouts
 const HISTORY_MAX_ENTRIES = 50; // safety cap so memory can't grow unbounded over a long event
 const HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000; // drop entries older than a day
 
@@ -53,6 +50,143 @@ function broadcastHistory() {
   channels[ch].forEach(client => {
     if (client.readyState === 1) client.send(payload);
   });
+}
+
+// Broadcasts the current count of sockets connected to the 'presence'
+// channel to everyone on it — used for the "X watching" indicator on the
+// public status page. No external API involved; purely a socket count.
+function broadcastPresence() {
+  const ch = 'presence';
+  const count = channels[ch] ? channels[ch].size : 0;
+  if (!channels[ch]) return;
+  const payload = JSON.stringify({ type: 'presence_count', count });
+  channels[ch].forEach(client => {
+    if (client.readyState === 1) client.send(payload);
+  });
+}
+
+// =========================================================================
+// YOUTUBE LIVE STATUS
+// Deliberately avoids the official YouTube Data API (search.list for live
+// broadcasts costs 100 quota units per call against a 10,000/day free quota —
+// roughly one check every 15 minutes to stay safe). Instead, this fetches
+// the channel's public /live page directly (a plain page load, not a metered
+// API call, no key required) and reads live status + concurrent viewers out
+// of the page's own embedded data. Kill switch below if you'd rather turn
+// this off entirely.
+// =========================================================================
+const YOUTUBE_CHANNEL_ID = 'UCkmZDvKGkG1AkX9A8idH1KA'; // @CollegiateJJLeague
+const YOUTUBE_CHECK_ENABLED = process.env.ENABLE_YOUTUBE_CHECK !== 'false'; // set to 'false' in Render env vars to disable entirely
+const YOUTUBE_POLL_MS = 60 * 1000; // 60s
+
+// Optional: set YOUTUBE_API_KEY in Render's Environment tab to unlock the
+// accurate path below. Without it, this still works using only the free
+// page-check (video ID + a regex-guessed live flag/viewer count). With it,
+// the video ID found by the free page-check gets confirmed and its viewer
+// count read from YouTube's own official videos.list endpoint — 1 quota
+// unit per call, so even polling every 60s all day (~1,440 calls) uses a
+// small fraction of the 10,000/day free quota. No code changes needed to
+// switch it on — just add the key and redeploy.
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || null;
+
+let youtubeStatus = { isLive: false, viewers: null };
+
+// Step 1 (always runs, free): find the current video ID via the channel's
+// public /live page. Works whether or not an API key is configured.
+function fetchYoutubeLiveStatus() {
+  if (!YOUTUBE_CHECK_ENABLED) return;
+  const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}/live`;
+  https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+    let body = '';
+    res.on('data', chunk => { body += chunk; });
+    res.on('end', () => {
+      try {
+        let videoId = null;
+        const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
+                                body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
+        if (canonicalMatch) videoId = canonicalMatch[1];
+
+        // Free signal first — a canonical video ID can show up on this page
+        // even when you're NOT currently live (e.g. it points at your last
+        // broadcast), so this flag is what actually gates whether we spend
+        // any API quota at all.
+        const freeSignalLive = !!videoId && (/"isLiveNow"\s*:\s*true/.test(body) || /"style"\s*:\s*"LIVE"/.test(body));
+
+        if (!freeSignalLive) {
+          // Not live (per the free check) — zero API calls, full stop.
+          applyYoutubeStatus(false, null);
+          return;
+        }
+
+        if (YOUTUBE_API_KEY) {
+          // Only reaches here when the free check already thinks you're
+          // live, so this confirms + gets an accurate viewer count — it
+          // does NOT run continuously while you're offline.
+          confirmLiveViaApi(videoId);
+        } else {
+          // No API key configured — use the free viewer-count guess instead.
+          let viewers = null;
+          const viewMatch = body.match(/"concurrentViewers"\s*:\s*"(\d+)"/);
+          if (viewMatch) viewers = parseInt(viewMatch[1], 10);
+          applyYoutubeStatus(true, viewers);
+        }
+      } catch (err) {
+        console.error('Failed to parse YouTube live page:', err.message);
+      }
+    });
+  }).on('error', (err) => {
+    console.error('YouTube live-status fetch failed:', err.message);
+  });
+}
+
+// Step 2 (only runs if YOUTUBE_API_KEY is set): official, authoritative
+// confirmation of live status + viewer count for a candidate video ID.
+function confirmLiveViaApi(videoId) {
+  const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
+  https.get(url, (res) => {
+    let body = '';
+    res.on('data', chunk => { body += chunk; });
+    res.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const item = data.items && data.items[0];
+        if (!item) { applyYoutubeStatus(false, null); return; }
+
+        const isLive = item.snippet && item.snippet.liveBroadcastContent === 'live';
+        const viewers = item.liveStreamingDetails && item.liveStreamingDetails.concurrentViewers
+          ? parseInt(item.liveStreamingDetails.concurrentViewers, 10)
+          : null;
+
+        applyYoutubeStatus(isLive, viewers);
+      } catch (err) {
+        console.error('Failed to parse YouTube Data API response:', err.message);
+      }
+    });
+  }).on('error', (err) => {
+    console.error('YouTube Data API fetch failed:', err.message);
+  });
+}
+
+function applyYoutubeStatus(isLive, viewers) {
+  const changed = youtubeStatus.isLive !== isLive || youtubeStatus.viewers !== viewers;
+  youtubeStatus = { isLive, viewers };
+  if (changed) broadcastYoutubeStatus();
+}
+
+function broadcastYoutubeStatus() {
+  const ch = 'youtube_status';
+  if (!channels[ch]) return;
+  const payload = JSON.stringify({ type: 'youtube_status', ...youtubeStatus });
+  channels[ch].forEach(client => {
+    if (client.readyState === 1) client.send(payload);
+  });
+}
+
+if (YOUTUBE_CHECK_ENABLED) {
+  fetchYoutubeLiveStatus();
+  setInterval(fetchYoutubeLiveStatus, YOUTUBE_POLL_MS);
+} else {
+  console.log('YouTube live-status check disabled via ENABLE_YOUTUBE_CHECK=false.');
 }
 
 function boutKey(state) {
@@ -95,7 +229,16 @@ function upsertBoutHistory(state) {
   broadcastHistory();
 }
 
+
 const server = http.createServer((req, res) => {
+  if (req.url === '/clear-history') {
+    archivedBouts.length = 0;
+    broadcastHistory();
+    console.log('Match history cleared via /clear-history (new tournament started).');
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('History cleared');
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('CJL Relay OK');
 });
@@ -141,6 +284,18 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({ type: 'history_update', bouts: archivedBouts }));
       }
 
+      // 'presence' is a lightweight viewer-count channel — anyone connected
+      // to it is counted as a current page viewer. No external API involved;
+      // this is purely a count of open sockets on this one channel.
+      if (ch === 'presence') {
+        broadcastPresence();
+      }
+
+      // Newly joined 'youtube_status' subscribers get the last known status immediately.
+      if (ch === 'youtube_status') {
+        ws.send(JSON.stringify({ type: 'youtube_status', ...youtubeStatus }));
+      }
+
     } else if (msg.type === 'state') {
       const ch = 'mat_' + msg.mat;
 
@@ -178,12 +333,14 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (joinedChannel && channels[joinedChannel]) {
       channels[joinedChannel].delete(ws);
+      if (joinedChannel === 'presence') broadcastPresence();
     }
   });
 
   ws.on('error', () => {
     if (joinedChannel && channels[joinedChannel]) {
       channels[joinedChannel].delete(ws);
+      if (joinedChannel === 'presence') broadcastPresence();
     }
   });
 });
