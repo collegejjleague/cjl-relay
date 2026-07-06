@@ -96,47 +96,68 @@ let youtubeStatus = { isLive: false, viewers: null };
 function fetchYoutubeLiveStatus() {
   if (!YOUTUBE_CHECK_ENABLED) return;
   console.log('Checking YouTube live status...');
-  const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}/live`;
-  https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-    let body = '';
-    res.on('data', chunk => { body += chunk; });
-    res.on('end', () => {
-      try {
-        let videoId = null;
-        const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
-                                body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
-        if (canonicalMatch) videoId = canonicalMatch[1];
 
-        const freeSignalLive = !!videoId && (/"isLiveNow"\s*:\s*true/.test(body) || /"style"\s*:\s*"LIVE"/.test(body));
-        console.log(`YouTube page check: videoId=${videoId}, freeSignalLive=${freeSignalLive}`);
-
-        if (!freeSignalLive) {
-          applyYoutubeStatus(false, null);
-          return;
+  if (YOUTUBE_API_KEY) {
+    // Use the API directly to search for live broadcasts from this channel
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${YOUTUBE_CHANNEL_ID}&type=video&eventType=live&key=${YOUTUBE_API_KEY}`;
+    https.get(url, (res) => {
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (data.items && data.items.length > 0) {
+            const videoId = data.items[0].id.videoId;
+            console.log(`Found live video via API search: ${videoId}`);
+            getVideoDetails(videoId);
+          } else {
+            console.log('No live broadcasts found');
+            applyYoutubeStatus(false, null);
+          }
+        } catch (err) {
+          console.error('Failed to parse YouTube search response:', err.message);
         }
+      });
+    }).on('error', (err) => {
+      console.error('YouTube search failed:', err.message);
+    });
+  } else {
+    // No API key — fall back to page scraping (less reliable but free)
+    const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}/live`;
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => {
+        try {
+          let videoId = null;
+          const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
+                                  body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
+          if (canonicalMatch) videoId = canonicalMatch[1];
 
-        if (YOUTUBE_API_KEY) {
-          console.log('Confirming live status via YouTube API...');
-          confirmLiveViaApi(videoId);
-        } else {
+          const freeSignalLive = !!videoId && (/"isLiveNow"\s*:\s*true/.test(body) || /"style"\s*:\s*"LIVE"/.test(body));
+          console.log(`YouTube page check: videoId=${videoId}, freeSignalLive=${freeSignalLive}`);
+
+          if (!freeSignalLive) {
+            applyYoutubeStatus(false, null);
+            return;
+          }
+
           let viewers = null;
           const viewMatch = body.match(/"concurrentViewers"\s*:\s*"(\d+)"/);
           if (viewMatch) viewers = parseInt(viewMatch[1], 10);
           console.log(`Using free page check: viewers=${viewers}`);
           applyYoutubeStatus(true, viewers);
+        } catch (err) {
+          console.error('Failed to parse YouTube live page:', err.message);
         }
-      } catch (err) {
-        console.error('Failed to parse YouTube live page:', err.message);
-      }
+      });
+    }).on('error', (err) => {
+      console.error('YouTube live-status fetch failed:', err.message);
     });
-  }).on('error', (err) => {
-    console.error('YouTube live-status fetch failed:', err.message);
-  });
+  }
 }
 
-// Step 2 (only runs if YOUTUBE_API_KEY is set): official, authoritative
-// confirmation of live status + viewer count for a candidate video ID.
-function confirmLiveViaApi(videoId) {
+function getVideoDetails(videoId) {
   const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
   https.get(url, (res) => {
     let body = '';
