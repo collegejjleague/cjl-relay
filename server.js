@@ -132,14 +132,28 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
     res.on('data', chunk => { body += chunk; });
     res.on('end', () => {
       try {
-        console.log(`YouTube fetch: status=${res.statusCode}, bodyLength=${body.length}, snippet="${body.slice(0, 120).replace(/\s+/g, ' ')}"`);
+        const titleMatch = body.match(/<title>([^<]*)<\/title>/);
+        console.log(`YouTube fetch: status=${res.statusCode}, bodyLength=${body.length}, title="${titleMatch ? titleMatch[1] : '(none found)'}"`);
+        console.log(`YouTube fetch diagnostics: hasCanonicalBaseUrl=${body.includes('"canonicalBaseUrl"')}, hasVideoIdKey=${body.includes('"videoId"')}, hasIsLiveNow=${body.includes('"isLiveNow"')}, hasLiveBadge=${body.includes('"style":"LIVE"')}, hasOgUrl=${body.includes('og:url')}`);
 
         let videoId = null;
         const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
-                                body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
+                                body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
+                                body.match(/<meta property="og:url" content="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
         if (canonicalMatch) videoId = canonicalMatch[1];
 
-        const freeSignalLive = !!videoId && (/"isLiveNow"\s*:\s*true/.test(body) || /"style"\s*:\s*"LIVE"/.test(body));
+        // Fallback: grab the first generic videoId key in the page if the
+        // more specific patterns above didn't match (YouTube's markup shifts
+        // over time; this is a looser net as a backstop).
+        if (!videoId) {
+          const genericMatch = body.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+          if (genericMatch) {
+            videoId = genericMatch[1];
+            console.log(`YouTube fetch: used generic videoId fallback match: ${videoId}`);
+          }
+        }
+
+        const freeSignalLive = !!videoId && (/"isLiveNow"\s*:\s*true/.test(body) || /"style":"LIVE"/.test(body));
         console.log(`YouTube page check: videoId=${videoId}, freeSignalLive=${freeSignalLive}`);
 
         if (!freeSignalLive) {
