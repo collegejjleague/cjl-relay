@@ -105,11 +105,35 @@ function fetchYoutubeLiveStatus() {
   console.log('Checking YouTube live status...');
 
   const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}/live`;
-  https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+  fetchYoutubeLivePage(url, 2);
+}
+
+function fetchYoutubeLivePage(url, redirectsLeft) {
+  https.get(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9',
+      // Bypasses YouTube's cookie-consent interstitial page, which is
+      // frequently served instead of real content to requests coming from
+      // datacenter/cloud IPs (like Render's) rather than residential ones.
+      // Without this, the scrape can silently get a consent page with none
+      // of the expected canonicalBaseUrl/isLiveNow data in it.
+      'Cookie': 'CONSENT=YES+cb.20240101-00-p0.en+FX+000'
+    }
+  }, (res) => {
+    if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
+      console.log(`YouTube fetch redirected (${res.statusCode}) to ${res.headers.location}`);
+      res.resume(); // discard this response body
+      fetchYoutubeLivePage(res.headers.location, redirectsLeft - 1);
+      return;
+    }
+
     let body = '';
     res.on('data', chunk => { body += chunk; });
     res.on('end', () => {
       try {
+        console.log(`YouTube fetch: status=${res.statusCode}, bodyLength=${body.length}, snippet="${body.slice(0, 120).replace(/\s+/g, ' ')}"`);
+
         let videoId = null;
         const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
                                 body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
