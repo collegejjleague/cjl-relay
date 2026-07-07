@@ -134,42 +134,54 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
       try {
         const titleMatch = body.match(/<title>([^<]*)<\/title>/);
         console.log(`YouTube fetch: status=${res.statusCode}, bodyLength=${body.length}, title="${titleMatch ? titleMatch[1] : '(none found)'}"`);
-        console.log(`YouTube fetch diagnostics: hasCanonicalBaseUrl=${body.includes('"canonicalBaseUrl"')}, hasVideoIdKey=${body.includes('"videoId"')}, hasIsLiveNow=${body.includes('"isLiveNow"')}, hasLiveBadge=${body.includes('"style":"LIVE"')}, hasOgUrl=${body.includes('og:url')}`);
+        console.log(`YouTube fetch diagnostics: hasCanonicalBaseUrl=${body.includes('"canonicalBaseUrl"')}, hasVideoDetails=${body.includes('"videoDetails"')}, hasIsLiveNow=${body.includes('"isLiveNow"')}, hasLiveBadge=${body.includes('"style":"LIVE"')}, hasOgUrl=${body.includes('og:url')}`);
 
         let videoId = null;
-        const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
-                                body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
-                                body.match(/<meta property="og:url" content="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
-        if (canonicalMatch) videoId = canonicalMatch[1];
+        let isLiveFromDetails = false;
 
-        // Fallback: grab the first generic videoId key in the page if the
-        // more specific patterns above didn't match (YouTube's markup shifts
-        // over time; this is a looser net as a backstop).
-        if (!videoId) {
-          const genericMatch = body.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-          if (genericMatch) {
-            videoId = genericMatch[1];
-            console.log(`YouTube fetch: used generic videoId fallback match: ${videoId}`);
-          }
+        // Primary source: videoDetails is the block YouTube embeds describing
+        // THE ACTUAL VIDEO this page is rendering — its videoId and isLive
+        // flag live right next to each other here. This avoids accidentally
+        // grabbing an unrelated video's ID from elsewhere on the page (e.g.
+        // a recommended video or another creator's live stream shown in a
+        // sidebar), which a bare "first videoId on the page" scan can do.
+        const vdIndex = body.indexOf('"videoDetails":{');
+        if (vdIndex !== -1) {
+          const windowStr = body.slice(vdIndex, vdIndex + 1000);
+          const vidMatch = windowStr.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+          if (vidMatch) videoId = vidMatch[1];
+          isLiveFromDetails = /"isLive":true/.test(windowStr) || /"isLiveContent":true/.test(windowStr);
         }
 
-        const freeSignalLive = !!videoId && (/"isLiveNow"\s*:\s*true/.test(body) || /"style":"LIVE"/.test(body));
-        console.log(`YouTube page check: videoId=${videoId}, freeSignalLive=${freeSignalLive}`);
+        // Secondary confirmation: canonical link patterns, if videoDetails
+        // wasn't found for some reason.
+        if (!videoId) {
+          const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
+                                  body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
+                                  body.match(/<meta property="og:url" content="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
+          if (canonicalMatch) videoId = canonicalMatch[1];
+        }
+
+        const freeSignalLive = !!videoId && isLiveFromDetails;
+        console.log(`YouTube page check: videoId=${videoId}, isLiveFromDetails=${isLiveFromDetails}, freeSignalLive=${freeSignalLive}`);
 
         if (!freeSignalLive) {
           applyYoutubeStatus(false, null);
           return;
         }
 
+        // Reuse the same bounded window we already found videoId/isLive in,
+        // so the viewer count we read also belongs to OUR video and not to
+        // an unrelated one elsewhere on the page.
+        const nearbyWindow = vdIndex !== -1 ? body.slice(vdIndex, vdIndex + 5000) : body;
+
         if (YOUTUBE_API_KEY) {
           // Enhancement only: get a precise, official viewer count for the
           // video ID we already confirmed is live. If this call fails for
           // any reason, still report live using whatever the free page gave us.
-          getVideoDetails(videoId, body);
+          getVideoDetails(videoId, nearbyWindow);
         } else {
-          let viewers = null;
-          const viewMatch = body.match(/"concurrentViewers"\s*:\s*"(\d+)"/);
-          if (viewMatch) viewers = parseInt(viewMatch[1], 10);
+          const viewers = freeViewerCountFrom(nearbyWindow);
           console.log(`Using free page check: viewers=${viewers}`);
           applyYoutubeStatus(true, viewers);
         }
