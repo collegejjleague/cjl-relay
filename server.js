@@ -160,7 +160,13 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
           const windowStr = body.slice(idx, idx + 1200);
           const vidMatch = windowStr.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
           const liveHere = /"isLive":true/.test(windowStr) || /"isLiveContent":true/.test(windowStr);
-          if (vidMatch && !fallbackVideoId) { fallbackVideoId = vidMatch[1]; fallbackIdx = idx; }
+          // Only trust this as a fallback if it's actually attached to our
+          // channel — otherwise an unrelated video's videoDetails block
+          // (e.g. a recommended-video hover-preview player) could occupy
+          // the videoId slot with a non-live, unrelated ID and block the
+          // channel-verified badge strategy further down from ever running.
+          const belongsToOurChannel = windowStr.includes(YOUTUBE_CHANNEL_ID);
+          if (vidMatch && !fallbackVideoId && belongsToOurChannel) { fallbackVideoId = vidMatch[1]; fallbackIdx = idx; }
           if (vidMatch && liveHere) {
             videoId = vidMatch[1];
             isLiveFromDetails = true;
@@ -186,21 +192,38 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
         // current markup, those cards use a lockupViewModel structure: the
         // live badge appears as badgeStyle:"THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE"
         // (not the older bare "style":"LIVE"), and the card's video ID lives
-        // in its own "contentId" field rather than "videoId". contentId
-        // reliably appears shortly BEFORE the badge within the same lockup
-        // object, so we find the badge, then look backward for the nearest
-        // preceding contentId.
+        // in its own "contentId" field rather than "videoId".
+        //
+        // IMPORTANT: a single page can contain multiple lockup cards — not
+        // just ours. If our channel isn't actually live, YouTube can still
+        // render OTHER creators' live streams elsewhere on the same page
+        // (recommended/"up next" shelves), each with their own LIVE badge.
+        // Blindly taking the first badge on the page means reporting
+        // someone else's stream as if it were ours. So: scan every live
+        // badge on the page, and only accept one whose nearby window also
+        // contains OUR channel ID — proof the card actually belongs to us.
         if (!videoId) {
-          const badgeIdx = body.indexOf('THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE');
-          if (badgeIdx !== -1) {
-            const precedingChunk = body.slice(Math.max(0, badgeIdx - 4000), badgeIdx);
-            const allContentIds = [...precedingChunk.matchAll(/"contentId":"([a-zA-Z0-9_-]{11})"/g)];
-            if (allContentIds.length > 0) {
-              videoId = allContentIds[allContentIds.length - 1][1]; // closest one before the badge
-              isLiveFromDetails = true; // the badge itself is our live confirmation here
-              matchedIdx = badgeIdx;
-              console.log(`YouTube fetch: used lockup badge-proximity match: ${videoId}`);
+          let badgeSearchFrom = 0;
+          while (true) {
+            const badgeIdx = body.indexOf('THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE', badgeSearchFrom);
+            if (badgeIdx === -1) break;
+
+            const windowStart = Math.max(0, badgeIdx - 4000);
+            const windowStr = body.slice(windowStart, badgeIdx + 2000);
+
+            if (windowStr.includes(YOUTUBE_CHANNEL_ID)) {
+              const precedingChunk = body.slice(windowStart, badgeIdx);
+              const allContentIds = [...precedingChunk.matchAll(/"contentId":"([a-zA-Z0-9_-]{11})"/g)];
+              if (allContentIds.length > 0) {
+                videoId = allContentIds[allContentIds.length - 1][1]; // closest one before the badge
+                isLiveFromDetails = true; // the badge itself is our live confirmation here
+                matchedIdx = badgeIdx;
+                console.log(`YouTube fetch: used lockup badge-proximity match (channel-verified): ${videoId}`);
+                break;
+              }
             }
+
+            badgeSearchFrom = badgeIdx + 1;
           }
         }
 
