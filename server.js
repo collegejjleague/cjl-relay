@@ -180,6 +180,27 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
           if (canonicalMatch) videoId = canonicalMatch[1];
         }
 
+        // Third strategy: the page may not be the live video's own watch
+        // page at all — it could be rendering the channel's feed, with the
+        // live stream just shown as a badged thumbnail card. In that shape,
+        // there's no videoDetails object for it, but the card's videoId
+        // reliably appears shortly BEFORE its "style":"LIVE" badge within
+        // the same renderer. Find the badge, then look backward for the
+        // nearest preceding videoId.
+        if (!videoId) {
+          const badgeIdx = body.indexOf('"style":"LIVE"');
+          if (badgeIdx !== -1) {
+            const precedingChunk = body.slice(Math.max(0, badgeIdx - 4000), badgeIdx);
+            const allVideoIds = [...precedingChunk.matchAll(/"videoId":"([a-zA-Z0-9_-]{11})"/g)];
+            if (allVideoIds.length > 0) {
+              videoId = allVideoIds[allVideoIds.length - 1][1]; // closest one before the badge
+              isLiveFromDetails = true; // the badge itself is our live confirmation here
+              matchedIdx = badgeIdx;
+              console.log(`YouTube fetch: used badge-proximity match: ${videoId}`);
+            }
+          }
+        }
+
         const freeSignalLive = !!videoId && isLiveFromDetails;
         console.log(`YouTube page check: videoId=${videoId}, isLiveFromDetails=${isLiveFromDetails}, freeSignalLive=${freeSignalLive}`);
 
