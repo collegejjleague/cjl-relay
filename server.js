@@ -145,13 +145,31 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
         // grabbing an unrelated video's ID from elsewhere on the page (e.g.
         // a recommended video or another creator's live stream shown in a
         // sidebar), which a bare "first videoId on the page" scan can do.
-        const vdIndex = body.indexOf('"videoDetails":{');
-        if (vdIndex !== -1) {
-          const windowStr = body.slice(vdIndex, vdIndex + 1000);
+        //
+        // There can be more than one "videoDetails" block on the page (e.g.
+        // hover-preview players for recommended videos also carry one), so
+        // we scan every occurrence and prefer whichever one actually reports
+        // isLive true, rather than just taking the first one found.
+        let fallbackVideoId = null;
+        let fallbackIdx = -1;
+        let matchedIdx = -1;
+        let searchFrom = 0;
+        while (true) {
+          const idx = body.indexOf('"videoDetails"', searchFrom);
+          if (idx === -1) break;
+          const windowStr = body.slice(idx, idx + 1200);
           const vidMatch = windowStr.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-          if (vidMatch) videoId = vidMatch[1];
-          isLiveFromDetails = /"isLive":true/.test(windowStr) || /"isLiveContent":true/.test(windowStr);
+          const liveHere = /"isLive":true/.test(windowStr) || /"isLiveContent":true/.test(windowStr);
+          if (vidMatch && !fallbackVideoId) { fallbackVideoId = vidMatch[1]; fallbackIdx = idx; }
+          if (vidMatch && liveHere) {
+            videoId = vidMatch[1];
+            isLiveFromDetails = true;
+            matchedIdx = idx;
+            break;
+          }
+          searchFrom = idx + 1;
         }
+        if (!videoId && fallbackVideoId) { videoId = fallbackVideoId; matchedIdx = fallbackIdx; }
 
         // Secondary confirmation: canonical link patterns, if videoDetails
         // wasn't found for some reason.
@@ -165,6 +183,7 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
         const freeSignalLive = !!videoId && isLiveFromDetails;
         console.log(`YouTube page check: videoId=${videoId}, isLiveFromDetails=${isLiveFromDetails}, freeSignalLive=${freeSignalLive}`);
 
+
         if (!freeSignalLive) {
           applyYoutubeStatus(false, null);
           return;
@@ -173,7 +192,7 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
         // Reuse the same bounded window we already found videoId/isLive in,
         // so the viewer count we read also belongs to OUR video and not to
         // an unrelated one elsewhere on the page.
-        const nearbyWindow = vdIndex !== -1 ? body.slice(vdIndex, vdIndex + 5000) : body;
+        const nearbyWindow = matchedIdx !== -1 ? body.slice(matchedIdx, matchedIdx + 5000) : body;
 
         if (YOUTUBE_API_KEY) {
           // Enhancement only: get a precise, official viewer count for the
