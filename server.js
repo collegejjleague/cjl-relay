@@ -216,7 +216,7 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
         // Reuse the same bounded window we already found videoId/isLive in,
         // so the viewer count we read also belongs to OUR video and not to
         // an unrelated one elsewhere on the page.
-        const nearbyWindow = matchedIdx !== -1 ? body.slice(matchedIdx, matchedIdx + 5000) : body;
+        const nearbyWindow = matchedIdx !== -1 ? body.slice(Math.max(0, matchedIdx - 2000), matchedIdx + 5000) : body;
 
         if (YOUTUBE_API_KEY) {
           // Enhancement only: get a precise, official viewer count for the
@@ -239,7 +239,32 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
 
 function freeViewerCountFrom(pageBody) {
   const viewMatch = pageBody.match(/"concurrentViewers"\s*:\s*"(\d+)"/);
-  return viewMatch ? parseInt(viewMatch[1], 10) : null;
+  if (viewMatch) return parseInt(viewMatch[1], 10);
+
+  // concurrentViewers only appears on the video's own watch page. When we
+  // detected liveness via the channel-feed lockup card instead (see the
+  // badge-proximity strategy above), there's no such field nearby — but the
+  // card itself usually renders a plain display string like "558 watching"
+  // or "1.2K watching" in its metadata text. That's an approximate,
+  // YouTube-rounded figure rather than an exact live count, but it's the
+  // only viewer signal available on this page type.
+  const watchingMatch = pageBody.match(/([\d,.]+\s*[KMB]?)\s*watching/i);
+  if (!watchingMatch) return null;
+
+  const approx = parseApproxCount(watchingMatch[1]);
+  if (approx !== null) console.log(`YouTube fetch: used approximate "watching" text fallback: "${watchingMatch[1]}" -> ${approx}`);
+  return approx;
+}
+
+// Converts YouTube's rounded display strings ("558", "1.2K", "3.4M") into a
+// plain integer. Returns null if the string doesn't look like a count.
+function parseApproxCount(str) {
+  const m = str.replace(/,/g, '').trim().match(/^([\d.]+)\s*([KMB]?)$/i);
+  if (!m) return null;
+  const num = parseFloat(m[1]);
+  if (Number.isNaN(num)) return null;
+  const mult = { K: 1e3, M: 1e6, B: 1e9 }[m[2].toUpperCase()] || 1;
+  return Math.round(num * mult);
 }
 
 // videoId and pageBody come from fetchYoutubeLiveStatus, which has already
