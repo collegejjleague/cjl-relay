@@ -66,237 +66,172 @@ function broadcastPresence() {
 }
 
 // =========================================================================
-// YOUTUBE LIVE STATUS
-// Deliberately avoids the official YouTube Data API (search.list for live
-// broadcasts costs 100 quota units per call against a 10,000/day free quota —
-// roughly one check every 15 minutes to stay safe). Instead, this fetches
-// the channel's public /live page directly (a plain page load, not a metered
-// API call, no key required) and reads live status + concurrent viewers out
-// of the page's own embedded data. Kill switch below if you'd rather turn
-// this off entirely.
+// YOUTUBE LIVE STATUS — hybrid trigger + confirm
+//
+// Two different YouTube page-HTML formats have already broken this feature
+// by changing without notice (regex-hunting for a "live" badge in scraped
+// markup is inherently fragile — YouTube can redesign that markup any time,
+// with no warning and no version number). To stop chasing that indefinitely,
+// live/offline status is now ALWAYS decided by YouTube's own official Data
+// API (search.list), which returns a small, stable, versioned JSON contract
+// instead of raw page HTML. That endpoint is the single source of truth for
+// what gets shown to viewers. It is never bypassed.
+//
+// The catch: search.list costs 100 quota units per call against a
+// 10,000/day free quota — enough for roughly one call every ~15 minutes on
+// a fixed timer, too slow for near-real-time detection. So instead of a
+// fixed timer, this uses a trigger/confirm pattern:
+//
+//   1. TRIGGER (free, every 60s): the old page-scrape, but now purely a
+//      *hint* that something might have changed. It is NEVER used to set
+//      status directly — so if YouTube changes their page markup again,
+//      the worst case is a missed/delayed hint, not a wrong status shown
+//      to viewers.
+//   2. CONFIRM (metered, only when needed): fires as soon as the trigger's
+//      hint disagrees with our last confirmed status, subject to a short
+//      cooldown so a flaky/flapping hint can't burn through quota.
+//   3. BACKSTOP (metered, every 20 min regardless): a periodic confirm even
+//      without a mismatch, in case the free trigger ever fails to catch a
+//      real transition at all — this bounds the maximum staleness of the
+//      status to 20 minutes no matter what happens to the scrape.
+//
+// Worst case quota usage: 24h / 20min = 72 backstop calls/day (7,200
+// units), leaving ~2,800 units (28 calls) of headroom for real go-live/
+// go-offline transitions — plenty for a normal event schedule. In
+// practice, real transitions get caught within ~60-90s of the trigger
+// noticing them, well under the 20-minute backstop ceiling.
+//
+// Requires YOUTUBE_API_KEY (Render → Environment tab). Without one, this
+// falls back to scrape-only behavior — faster, free, but exactly as
+// fragile to YouTube markup changes as before. Setting the key is
+// strongly recommended; you already have one configured.
 // =========================================================================
 const YOUTUBE_CHANNEL_ID = 'UCkmZDvKGkG1AkX9A8idH1KA'; // @CollegiateJJLeague
 const YOUTUBE_CHECK_ENABLED = process.env.ENABLE_YOUTUBE_CHECK !== 'false'; // set to 'false' in Render env vars to disable entirely
-const YOUTUBE_POLL_MS = 60 * 1000; // 60s
-
-// Optional: set YOUTUBE_API_KEY in Render's Environment tab to unlock the
-// accurate path below. Without it, this still works using only the free
-// page-check (video ID + a regex-guessed live flag/viewer count). With it,
-// the video ID found by the free page-check gets confirmed and its viewer
-// count read from YouTube's own official videos.list endpoint — 1 quota
-// unit per call, so even polling every 60s all day (~1,440 calls) uses a
-// small fraction of the 10,000/day free quota. No code changes needed to
-// switch it on — just add the key and redeploy.
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || null;
 
-let youtubeStatus = { isLive: false, viewers: null };
+const TRIGGER_POLL_MS = 60 * 1000;          // free scrape hint, every 60s
+const CONFIRM_COOLDOWN_MS = 90 * 1000;      // min gap between API confirm calls
+const CONFIRM_BACKSTOP_MS = 20 * 60 * 1000; // force a confirm at least this often regardless of the hint
 
-// Detection ALWAYS runs via the free page-scrape, whether or not an API key
-// is configured. This is deliberate: YouTube's official search.list?eventType=live
-// endpoint is index-based, not real-time, and is well documented to be slow
-// or unreliable to reflect a stream that just went live — sometimes taking
-// several minutes, sometimes never surfacing it in time. The public /live
-// page, by contrast, reads live status directly off the page's own embedded
-// data with no such delay. If an API key is present, it's only used
-// afterward, as an enhancement, to fetch a precise concurrentViewers count
-// for a video ID we already know is live from the scrape.
-function fetchYoutubeLiveStatus() {
+let youtubeStatus = { isLive: false, viewers: null };
+let lastConfirmAt = 0;
+let confirmInFlight = false;
+
+function pollYoutube() {
   if (!YOUTUBE_CHECK_ENABLED) return;
-  console.log('Checking YouTube live status...');
+
+  if (!YOUTUBE_API_KEY) {
+    // No key configured: legacy scrape-only behavior. Fragile to YouTube
+    // markup changes (as we've seen), but works with zero setup.
+    const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}/live`;
+    fetchTriggerHint(url, 2, (guessLive) => applyYoutubeStatus(guessLive, null));
+    return;
+  }
 
   const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}/live`;
-  fetchYoutubeLivePage(url, 2);
+  fetchTriggerHint(url, 2, (guessLive) => maybeConfirm(guessLive));
 }
 
-function fetchYoutubeLivePage(url, redirectsLeft) {
+// Runs the page-scrape purely to produce a best-effort guess of whether the
+// channel might currently be live. In hybrid (API-key) mode this guess is
+// NEVER applied directly to youtubeStatus — it only decides whether to
+// spend a confirm call. A wrong guess here costs one wasted-but-harmless
+// API confirm; it can never cause a wrong status to reach viewers.
+function fetchTriggerHint(url, redirectsLeft, callback) {
   https.get(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
       'Accept-Language': 'en-US,en;q=0.9',
-      // Bypasses YouTube's cookie-consent interstitial page, which is
-      // frequently served instead of real content to requests coming from
-      // datacenter/cloud IPs (like Render's) rather than residential ones.
-      // Without this, the scrape can silently get a consent page with none
-      // of the expected canonicalBaseUrl/isLiveNow data in it.
       'Cookie': 'CONSENT=YES+cb.20240101-00-p0.en+FX+000'
     }
   }, (res) => {
     if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
-      console.log(`YouTube fetch redirected (${res.statusCode}) to ${res.headers.location}`);
-      res.resume(); // discard this response body
-      fetchYoutubeLivePage(res.headers.location, redirectsLeft - 1);
+      res.resume();
+      fetchTriggerHint(res.headers.location, redirectsLeft - 1, callback);
       return;
     }
-
     let body = '';
     res.on('data', chunk => { body += chunk; });
     res.on('end', () => {
-      try {
-        const titleMatch = body.match(/<title>([^<]*)<\/title>/);
-        console.log(`YouTube fetch: status=${res.statusCode}, bodyLength=${body.length}, title="${titleMatch ? titleMatch[1] : '(none found)'}"`);
-        console.log(`YouTube fetch diagnostics: hasCanonicalBaseUrl=${body.includes('"canonicalBaseUrl"')}, hasVideoDetails=${body.includes('"videoDetails"')}, hasIsLiveNow=${body.includes('"isLiveNow"')}, hasLiveBadge=${body.includes('THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE')}, hasOgUrl=${body.includes('og:url')}`);
-
-        let videoId = null;
-        let isLiveFromDetails = false;
-
-        // Primary source: videoDetails is the block YouTube embeds describing
-        // THE ACTUAL VIDEO this page is rendering — its videoId and isLive
-        // flag live right next to each other here. This avoids accidentally
-        // grabbing an unrelated video's ID from elsewhere on the page (e.g.
-        // a recommended video or another creator's live stream shown in a
-        // sidebar), which a bare "first videoId on the page" scan can do.
-        //
-        // There can be more than one "videoDetails" block on the page (e.g.
-        // hover-preview players for recommended videos also carry one), so
-        // we scan every occurrence and prefer whichever one actually reports
-        // isLive true, rather than just taking the first one found.
-        let fallbackVideoId = null;
-        let fallbackIdx = -1;
-        let matchedIdx = -1;
-        let searchFrom = 0;
-        while (true) {
-          const idx = body.indexOf('"videoDetails"', searchFrom);
-          if (idx === -1) break;
-          const windowStr = body.slice(idx, idx + 1200);
-          const vidMatch = windowStr.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-          const liveHere = /"isLive":true/.test(windowStr) || /"isLiveContent":true/.test(windowStr);
-          // Only trust this as a fallback if it's actually attached to our
-          // channel — otherwise an unrelated video's videoDetails block
-          // (e.g. a recommended-video hover-preview player) could occupy
-          // the videoId slot with a non-live, unrelated ID and block the
-          // channel-verified badge strategy further down from ever running.
-          const belongsToOurChannel = windowStr.includes(YOUTUBE_CHANNEL_ID);
-          if (vidMatch && !fallbackVideoId && belongsToOurChannel) { fallbackVideoId = vidMatch[1]; fallbackIdx = idx; }
-          if (vidMatch && liveHere) {
-            videoId = vidMatch[1];
-            isLiveFromDetails = true;
-            matchedIdx = idx;
-            break;
-          }
-          searchFrom = idx + 1;
-        }
-        if (!videoId && fallbackVideoId) { videoId = fallbackVideoId; matchedIdx = fallbackIdx; }
-
-        // Secondary confirmation: canonical link patterns, if videoDetails
-        // wasn't found for some reason.
-        if (!videoId) {
-          const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
-                                  body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
-                                  body.match(/<meta property="og:url" content="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
-          if (canonicalMatch) videoId = canonicalMatch[1];
-        }
-
-        // Third strategy: the page may not be the live video's own watch
-        // page at all — it could be rendering the channel's feed, with the
-        // live stream just shown as a badged thumbnail card. As of YouTube's
-        // current markup, those cards use a lockupViewModel structure: the
-        // live badge appears as badgeStyle:"THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE"
-        // (not the older bare "style":"LIVE"), and the card's video ID lives
-        // in its own "contentId" field rather than "videoId".
-        //
-        // IMPORTANT: a single page can contain multiple lockup cards — not
-        // just ours. If our channel isn't actually live, YouTube can still
-        // render OTHER creators' live streams elsewhere on the same page
-        // (recommended/"up next" shelves), each with their own LIVE badge.
-        // Blindly taking the first badge on the page means reporting
-        // someone else's stream as if it were ours. So: scan every live
-        // badge on the page, and only accept one whose nearby window also
-        // contains OUR channel ID — proof the card actually belongs to us.
-        if (!videoId) {
-          let badgeSearchFrom = 0;
-          while (true) {
-            const badgeIdx = body.indexOf('THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE', badgeSearchFrom);
-            if (badgeIdx === -1) break;
-
-            const windowStart = Math.max(0, badgeIdx - 4000);
-            const windowStr = body.slice(windowStart, badgeIdx + 2000);
-
-            if (windowStr.includes(YOUTUBE_CHANNEL_ID)) {
-              const precedingChunk = body.slice(windowStart, badgeIdx);
-              const allContentIds = [...precedingChunk.matchAll(/"contentId":"([a-zA-Z0-9_-]{11})"/g)];
-              if (allContentIds.length > 0) {
-                videoId = allContentIds[allContentIds.length - 1][1]; // closest one before the badge
-                isLiveFromDetails = true; // the badge itself is our live confirmation here
-                matchedIdx = badgeIdx;
-                console.log(`YouTube fetch: used lockup badge-proximity match (channel-verified): ${videoId}`);
-                break;
-              }
-            }
-
-            badgeSearchFrom = badgeIdx + 1;
-          }
-        }
-
-        const freeSignalLive = !!videoId && isLiveFromDetails;
-        console.log(`YouTube page check: videoId=${videoId}, isLiveFromDetails=${isLiveFromDetails}, freeSignalLive=${freeSignalLive}`);
-
-
-        if (!freeSignalLive) {
-          applyYoutubeStatus(false, null);
-          return;
-        }
-
-        // Reuse the same bounded window we already found videoId/isLive in,
-        // so the viewer count we read also belongs to OUR video and not to
-        // an unrelated one elsewhere on the page.
-        const nearbyWindow = matchedIdx !== -1 ? body.slice(Math.max(0, matchedIdx - 2000), matchedIdx + 5000) : body;
-
-        if (YOUTUBE_API_KEY) {
-          // Enhancement only: get a precise, official viewer count for the
-          // video ID we already confirmed is live. If this call fails for
-          // any reason, still report live using whatever the free page gave us.
-          getVideoDetails(videoId, nearbyWindow);
-        } else {
-          const viewers = freeViewerCountFrom(nearbyWindow);
-          console.log(`Using free page check: viewers=${viewers}`);
-          applyYoutubeStatus(true, viewers);
-        }
-      } catch (err) {
-        console.error('Failed to parse YouTube live page:', err.message);
-      }
+      const guessLive = guessLiveFromBody(body);
+      console.log(`YouTube trigger hint: guessLive=${guessLive}, bodyLength=${body.length}`);
+      callback(guessLive);
     });
   }).on('error', (err) => {
-    console.error('YouTube live-status fetch failed:', err.message);
+    console.error('YouTube trigger fetch failed:', err.message);
+    callback(youtubeStatus.isLive);
   });
 }
 
-function freeViewerCountFrom(pageBody) {
-  const viewMatch = pageBody.match(/"concurrentViewers"\s*:\s*"(\d+)"/);
-  if (viewMatch) return parseInt(viewMatch[1], 10);
-
-  // concurrentViewers only appears on the video's own watch page. When we
-  // detected liveness via the channel-feed lockup card instead (see the
-  // badge-proximity strategy above), there's no such field nearby — but the
-  // card itself usually renders a plain display string like "558 watching"
-  // or "1.2K watching" in its metadata text. That's an approximate,
-  // YouTube-rounded figure rather than an exact live count, but it's the
-  // only viewer signal available on this page type.
-  const watchingMatch = pageBody.match(/([\d,.]+\s*[KMB]?)\s*watching/i);
-  if (!watchingMatch) return null;
-
-  const approx = parseApproxCount(watchingMatch[1]);
-  if (approx !== null) console.log(`YouTube fetch: used approximate "watching" text fallback: "${watchingMatch[1]}" -> ${approx}`);
-  return approx;
+function guessLiveFromBody(body) {
+  let idx = 0;
+  while (true) {
+    const foundIdx = body.indexOf('"videoDetails"', idx);
+    if (foundIdx === -1) break;
+    const windowStr = body.slice(foundIdx, foundIdx + 1200);
+    if (/"isLive":true/.test(windowStr) || /"isLiveContent":true/.test(windowStr)) return true;
+    idx = foundIdx + 1;
+  }
+  let badgeIdx = 0;
+  while (true) {
+    const foundIdx = body.indexOf('THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE', badgeIdx);
+    if (foundIdx === -1) break;
+    const windowStr = body.slice(Math.max(0, foundIdx - 4000), foundIdx + 2000);
+    if (windowStr.includes(YOUTUBE_CHANNEL_ID)) return true;
+    badgeIdx = foundIdx + 1;
+  }
+  return false;
 }
 
-// Converts YouTube's rounded display strings ("558", "1.2K", "3.4M") into a
-// plain integer. Returns null if the string doesn't look like a count.
-function parseApproxCount(str) {
-  const m = str.replace(/,/g, '').trim().match(/^([\d.]+)\s*([KMB]?)$/i);
-  if (!m) return null;
-  const num = parseFloat(m[1]);
-  if (Number.isNaN(num)) return null;
-  const mult = { K: 1e3, M: 1e6, B: 1e9 }[m[2].toUpperCase()] || 1;
-  return Math.round(num * mult);
+function maybeConfirm(guessLive) {
+  const now = Date.now();
+  const mismatch = guessLive !== youtubeStatus.isLive;
+  const dueForBackstop = now - lastConfirmAt >= CONFIRM_BACKSTOP_MS;
+  const cooledDown = now - lastConfirmAt >= CONFIRM_COOLDOWN_MS;
+
+  if (confirmInFlight) return;
+  if ((mismatch && cooledDown) || dueForBackstop) {
+    console.log(`YouTube: confirming via official API (mismatch=${mismatch}, dueForBackstop=${dueForBackstop})...`);
+    lastConfirmAt = now;
+    confirmViaApi();
+  }
 }
 
-// videoId and pageBody come from fetchYoutubeLiveStatus, which has already
-// confirmed via page-scrape that this video is live right now. This function
-// only tries to get a more precise official viewer count — a failure here
-// should never flip status back to offline, since we already know it's live.
-function getVideoDetails(videoId, pageBody) {
-  const fallbackViewers = freeViewerCountFrom(pageBody);
-  const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
+function confirmViaApi() {
+  confirmInFlight = true;
+  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${YOUTUBE_CHANNEL_ID}&eventType=live&type=video&key=${YOUTUBE_API_KEY}`;
+  https.get(url, (res) => {
+    let body = '';
+    res.on('data', chunk => { body += chunk; });
+    res.on('end', () => {
+      confirmInFlight = false;
+      try {
+        const data = JSON.parse(body);
+        if (data.error) {
+          console.error('YouTube search.list error:', data.error.message);
+          return;
+        }
+        const item = data.items && data.items[0];
+        if (!item || !item.id || !item.id.videoId) {
+          console.log('YouTube API confirm: not live.');
+          applyYoutubeStatus(false, null);
+          return;
+        }
+        console.log(`YouTube API confirm: live, videoId=${item.id.videoId}`);
+        getVideoDetails(item.id.videoId);
+      } catch (err) {
+        console.error('Failed to parse YouTube search.list response:', err.message);
+      }
+    });
+  }).on('error', (err) => {
+    confirmInFlight = false;
+    console.error('YouTube search.list fetch failed:', err.message);
+  });
+}
+
+function getVideoDetails(videoId) {
+  const url = `https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
   https.get(url, (res) => {
     let body = '';
     res.on('data', chunk => { body += chunk; });
@@ -304,26 +239,18 @@ function getVideoDetails(videoId, pageBody) {
       try {
         const data = JSON.parse(body);
         const item = data.items && data.items[0];
-        if (!item) {
-          console.log('YouTube API: no video item found, using free page check as fallback');
-          applyYoutubeStatus(true, fallbackViewers);
-          return;
-        }
-
-        const viewers = item.liveStreamingDetails && item.liveStreamingDetails.concurrentViewers
+        const viewers = item && item.liveStreamingDetails && item.liveStreamingDetails.concurrentViewers
           ? parseInt(item.liveStreamingDetails.concurrentViewers, 10)
-          : fallbackViewers;
-
-        console.log(`YouTube API confirmed live, viewers=${viewers}`);
+          : null;
         applyYoutubeStatus(true, viewers);
       } catch (err) {
-        console.error('Failed to parse YouTube Data API response, using free page check as fallback:', err.message);
-        applyYoutubeStatus(true, fallbackViewers);
+        console.error('Failed to parse YouTube videos.list response:', err.message);
+        applyYoutubeStatus(true, null);
       }
     });
   }).on('error', (err) => {
-    console.error('YouTube Data API fetch failed, using free page check as fallback:', err.message);
-    applyYoutubeStatus(true, fallbackViewers);
+    console.error('YouTube videos.list fetch failed:', err.message);
+    applyYoutubeStatus(true, null);
   });
 }
 
@@ -347,12 +274,13 @@ function broadcastYoutubeStatus() {
 }
 
 if (YOUTUBE_CHECK_ENABLED) {
-  console.log(`YouTube live-status check enabled. Polling every ${YOUTUBE_POLL_MS}ms. Channel ID: ${YOUTUBE_CHANNEL_ID}`);
-  fetchYoutubeLiveStatus();
-  setInterval(fetchYoutubeLiveStatus, YOUTUBE_POLL_MS);
+  console.log(`YouTube live-status check enabled. Trigger polling every ${TRIGGER_POLL_MS}ms. Hybrid API-confirm mode: ${!!YOUTUBE_API_KEY}. Channel ID: ${YOUTUBE_CHANNEL_ID}`);
+  pollYoutube();
+  setInterval(pollYoutube, TRIGGER_POLL_MS);
 } else {
   console.log('YouTube live-status check disabled via ENABLE_YOUTUBE_CHECK=false.');
 }
+
 
 function boutKey(state) {
   return (state.boutNum || '') + '::' + (state.school1 || '') + '::' + (state.school2 || '');
