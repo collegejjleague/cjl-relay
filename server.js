@@ -91,73 +91,70 @@ const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || null;
 
 let youtubeStatus = { isLive: false, viewers: null };
 
-// Step 1 (always runs, free): find the current video ID via the channel's
-// public /live page. Works whether or not an API key is configured.
+// Detection ALWAYS runs via the free page-scrape, whether or not an API key
+// is configured. This is deliberate: YouTube's official search.list?eventType=live
+// endpoint is index-based, not real-time, and is well documented to be slow
+// or unreliable to reflect a stream that just went live — sometimes taking
+// several minutes, sometimes never surfacing it in time. The public /live
+// page, by contrast, reads live status directly off the page's own embedded
+// data with no such delay. If an API key is present, it's only used
+// afterward, as an enhancement, to fetch a precise concurrentViewers count
+// for a video ID we already know is live from the scrape.
 function fetchYoutubeLiveStatus() {
   if (!YOUTUBE_CHECK_ENABLED) return;
   console.log('Checking YouTube live status...');
 
-  if (YOUTUBE_API_KEY) {
-    // Use the API directly to search for live broadcasts from this channel
-    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${YOUTUBE_CHANNEL_ID}&type=video&eventType=live&key=${YOUTUBE_API_KEY}`;
-    https.get(url, (res) => {
-      let body = '';
-      res.on('data', chunk => { body += chunk; });
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          if (data.items && data.items.length > 0) {
-            const videoId = data.items[0].id.videoId;
-            console.log(`Found live video via API search: ${videoId}`);
-            getVideoDetails(videoId);
-          } else {
-            console.log('No live broadcasts found');
-            applyYoutubeStatus(false, null);
-          }
-        } catch (err) {
-          console.error('Failed to parse YouTube search response:', err.message);
+  const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}/live`;
+  https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+    let body = '';
+    res.on('data', chunk => { body += chunk; });
+    res.on('end', () => {
+      try {
+        let videoId = null;
+        const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
+                                body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
+        if (canonicalMatch) videoId = canonicalMatch[1];
+
+        const freeSignalLive = !!videoId && (/"isLiveNow"\s*:\s*true/.test(body) || /"style"\s*:\s*"LIVE"/.test(body));
+        console.log(`YouTube page check: videoId=${videoId}, freeSignalLive=${freeSignalLive}`);
+
+        if (!freeSignalLive) {
+          applyYoutubeStatus(false, null);
+          return;
         }
-      });
-    }).on('error', (err) => {
-      console.error('YouTube search failed:', err.message);
-    });
-  } else {
-    // No API key — fall back to page scraping (less reliable but free)
-    const url = `https://www.youtube.com/channel/${YOUTUBE_CHANNEL_ID}/live`;
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      let body = '';
-      res.on('data', chunk => { body += chunk; });
-      res.on('end', () => {
-        try {
-          let videoId = null;
-          const canonicalMatch = body.match(/"canonicalBaseUrl":"\/watch\?v=([a-zA-Z0-9_-]+)"/) ||
-                                  body.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)"/);
-          if (canonicalMatch) videoId = canonicalMatch[1];
 
-          const freeSignalLive = !!videoId && (/"isLiveNow"\s*:\s*true/.test(body) || /"style"\s*:\s*"LIVE"/.test(body));
-          console.log(`YouTube page check: videoId=${videoId}, freeSignalLive=${freeSignalLive}`);
-
-          if (!freeSignalLive) {
-            applyYoutubeStatus(false, null);
-            return;
-          }
-
+        if (YOUTUBE_API_KEY) {
+          // Enhancement only: get a precise, official viewer count for the
+          // video ID we already confirmed is live. If this call fails for
+          // any reason, still report live using whatever the free page gave us.
+          getVideoDetails(videoId, body);
+        } else {
           let viewers = null;
           const viewMatch = body.match(/"concurrentViewers"\s*:\s*"(\d+)"/);
           if (viewMatch) viewers = parseInt(viewMatch[1], 10);
           console.log(`Using free page check: viewers=${viewers}`);
           applyYoutubeStatus(true, viewers);
-        } catch (err) {
-          console.error('Failed to parse YouTube live page:', err.message);
         }
-      });
-    }).on('error', (err) => {
-      console.error('YouTube live-status fetch failed:', err.message);
+      } catch (err) {
+        console.error('Failed to parse YouTube live page:', err.message);
+      }
     });
-  }
+  }).on('error', (err) => {
+    console.error('YouTube live-status fetch failed:', err.message);
+  });
 }
 
-function getVideoDetails(videoId) {
+function freeViewerCountFrom(pageBody) {
+  const viewMatch = pageBody.match(/"concurrentViewers"\s*:\s*"(\d+)"/);
+  return viewMatch ? parseInt(viewMatch[1], 10) : null;
+}
+
+// videoId and pageBody come from fetchYoutubeLiveStatus, which has already
+// confirmed via page-scrape that this video is live right now. This function
+// only tries to get a more precise official viewer count — a failure here
+// should never flip status back to offline, since we already know it's live.
+function getVideoDetails(videoId, pageBody) {
+  const fallbackViewers = freeViewerCountFrom(pageBody);
   const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
   https.get(url, (res) => {
     let body = '';
@@ -166,25 +163,26 @@ function getVideoDetails(videoId) {
       try {
         const data = JSON.parse(body);
         const item = data.items && data.items[0];
-        if (!item) { 
-          console.log('YouTube API: no video item found');
-          applyYoutubeStatus(false, null); 
-          return; 
+        if (!item) {
+          console.log('YouTube API: no video item found, using free page check as fallback');
+          applyYoutubeStatus(true, fallbackViewers);
+          return;
         }
 
-        const isLive = item.snippet && item.snippet.liveBroadcastContent === 'live';
         const viewers = item.liveStreamingDetails && item.liveStreamingDetails.concurrentViewers
           ? parseInt(item.liveStreamingDetails.concurrentViewers, 10)
-          : null;
+          : fallbackViewers;
 
-        console.log(`YouTube API confirmed: isLive=${isLive}, viewers=${viewers}`);
-        applyYoutubeStatus(isLive, viewers);
+        console.log(`YouTube API confirmed live, viewers=${viewers}`);
+        applyYoutubeStatus(true, viewers);
       } catch (err) {
-        console.error('Failed to parse YouTube Data API response:', err.message);
+        console.error('Failed to parse YouTube Data API response, using free page check as fallback:', err.message);
+        applyYoutubeStatus(true, fallbackViewers);
       }
     });
   }).on('error', (err) => {
-    console.error('YouTube Data API fetch failed:', err.message);
+    console.error('YouTube Data API fetch failed, using free page check as fallback:', err.message);
+    applyYoutubeStatus(true, fallbackViewers);
   });
 }
 
