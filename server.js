@@ -134,7 +134,7 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
       try {
         const titleMatch = body.match(/<title>([^<]*)<\/title>/);
         console.log(`YouTube fetch: status=${res.statusCode}, bodyLength=${body.length}, title="${titleMatch ? titleMatch[1] : '(none found)'}"`);
-        console.log(`YouTube fetch diagnostics: hasCanonicalBaseUrl=${body.includes('"canonicalBaseUrl"')}, hasVideoDetails=${body.includes('"videoDetails"')}, hasIsLiveNow=${body.includes('"isLiveNow"')}, hasLiveBadge=${body.includes('"style":"LIVE"')}, hasOgUrl=${body.includes('og:url')}`);
+        console.log(`YouTube fetch diagnostics: hasCanonicalBaseUrl=${body.includes('"canonicalBaseUrl"')}, hasVideoDetails=${body.includes('"videoDetails"')}, hasIsLiveNow=${body.includes('"isLiveNow"')}, hasLiveBadge=${body.includes('THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE')}, hasOgUrl=${body.includes('og:url')}`);
 
         let videoId = null;
         let isLiveFromDetails = false;
@@ -182,21 +182,24 @@ function fetchYoutubeLivePage(url, redirectsLeft) {
 
         // Third strategy: the page may not be the live video's own watch
         // page at all — it could be rendering the channel's feed, with the
-        // live stream just shown as a badged thumbnail card. In that shape,
-        // there's no videoDetails object for it, but the card's videoId
-        // reliably appears shortly BEFORE its "style":"LIVE" badge within
-        // the same renderer. Find the badge, then look backward for the
-        // nearest preceding videoId.
+        // live stream just shown as a badged thumbnail card. As of YouTube's
+        // current markup, those cards use a lockupViewModel structure: the
+        // live badge appears as badgeStyle:"THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE"
+        // (not the older bare "style":"LIVE"), and the card's video ID lives
+        // in its own "contentId" field rather than "videoId". contentId
+        // reliably appears shortly BEFORE the badge within the same lockup
+        // object, so we find the badge, then look backward for the nearest
+        // preceding contentId.
         if (!videoId) {
-          const badgeIdx = body.indexOf('"style":"LIVE"');
+          const badgeIdx = body.indexOf('THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE');
           if (badgeIdx !== -1) {
             const precedingChunk = body.slice(Math.max(0, badgeIdx - 4000), badgeIdx);
-            const allVideoIds = [...precedingChunk.matchAll(/"videoId":"([a-zA-Z0-9_-]{11})"/g)];
-            if (allVideoIds.length > 0) {
-              videoId = allVideoIds[allVideoIds.length - 1][1]; // closest one before the badge
+            const allContentIds = [...precedingChunk.matchAll(/"contentId":"([a-zA-Z0-9_-]{11})"/g)];
+            if (allContentIds.length > 0) {
+              videoId = allContentIds[allContentIds.length - 1][1]; // closest one before the badge
               isLiveFromDetails = true; // the badge itself is our live confirmation here
               matchedIdx = badgeIdx;
-              console.log(`YouTube fetch: used badge-proximity match: ${videoId}`);
+              console.log(`YouTube fetch: used lockup badge-proximity match: ${videoId}`);
             }
           }
         }
