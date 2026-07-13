@@ -29,6 +29,12 @@ const STATE_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes — covers a real refresh
 // completed since the relay process last started — a relay restart clears
 // it. In exchange, there is zero ongoing API/network cost of any kind.
 // =========================================================================
+// Latest bracket payload per division (mens_champ, mens_con, womens_champ,
+// womens_con, supermatches, ...). Same idea as stateCache above, but keyed by
+// division instead of mat — replayed to newly-joined 'bracket' clients so a
+// status page opened mid-tournament isn't blank until the next operator push.
+const bracketCache = {};
+
 const archivedBouts = [];       // most-recent-first array of completed bouts
 const HISTORY_MAX_ENTRIES = 50; // safety cap so memory can't grow unbounded over a long event
 const HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000; // drop entries older than a day
@@ -168,6 +174,14 @@ wss.on('connection', (ws) => {
         broadcastPresence();
       }
 
+      // Newly joined 'bracket' subscribers get whatever's been cached so far,
+      // one message per division.
+      if (ch === 'bracket') {
+        Object.keys(bracketCache).forEach(division => {
+          ws.send(JSON.stringify({ type: 'bracket', division, data: bracketCache[division] }));
+        });
+      }
+
     } else if (msg.type === 'state') {
       const ch = 'mat_' + msg.mat;
 
@@ -189,6 +203,7 @@ wss.on('connection', (ws) => {
 
     } else if (msg.type === 'bracket') {
       const ch = 'bracket';
+      if (msg.division) bracketCache[msg.division] = msg.data;
       if (!channels[ch]) return;
       const payload = JSON.stringify(msg);
       channels[ch].forEach(client => {
